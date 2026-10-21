@@ -1,0 +1,140 @@
+name: Build IPA
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  APP_NAME: Logline
+  HOMEBREW_NO_AUTO_UPDATE: "1"
+  HOMEBREW_NO_INSTALL_CLEANUP: "1"
+
+jobs:
+  build:
+    name: Build and publish unsigned IPA
+    runs-on: macos-26
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v5
+
+      - name: Show toolchain
+        run: |
+          sw_vers
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Install XcodeGen and ldid
+        run: |
+          brew install xcodegen
+          brew install ldid || echo "::warning::ldid could not be installed, so the IPA will be unsigned"
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Build for device
+        env:
+          BUILD_NUMBER: ${{ github.run_number }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -o pipefail
+          build() {
+            xcodebuild \
+              -project "$APP_NAME.xcodeproj" \
+              -scheme "$APP_NAME" \
+              -configuration Release \
+              -sdk iphoneos \
+              -destination 'generic/platform=iOS' \
+              -derivedDataPath build \
+              -quiet \
+              CODE_SIGN_IDENTITY="" \
+              CODE_SIGNING_REQUIRED=NO \
+              CODE_SIGNING_ALLOWED=NO \
+              CURRENT_PROJECT_VERSION="$BUILD_NUMBER" \
+              LOGLINE_GITHUB_REPO="$REPO" \
+              build 2>&1 | tee build.log
+          }
+          if ! build; then
+            if grep -qiE "is not installed|no simulator runtime|platform.*not.*installed" build.log; then
+              echo "::warning::The iOS platform is missing on this runner. Downloading it and retrying."
+              xcodebuild -downloadPlatform iOS
+              build
+            else
+              exit 1
+            fi
+          fi
+
+      - name: List compiler errors
+        if: failure()
+        run: |
+          if [ -f build.log ]; then
+            grep -E "error:" build.log | sort -u | head -40 | while IFS= read -r line; do
+              echo "::error::$line"
+            done
+          fi
+
+      - name: Package IPA
+        run: |
+          APP="build/Build/Products/Release-iphoneos/$APP_NAME.app"
+          if [ ! -d "$APP" ]; then
+            echo "::error::The build finished but $APP is missing"
+            find build/Build/Products -maxdepth 2 -print || true
+            exit 1
+          fi
+          if command -v ldid >/dev/null 2>&1; then
+            ldid -S"Resources/$APP_NAME.entitlements" "$APP/$APP_NAME" \
+              && echo "Fakesigned with Resources/$APP_NAME.entitlements" \
+              || echo "::warning::ldid couldn't sign the app, so the IPA is unsigned"
+          fi
+          rm -rf Payload "$APP_NAME.ipa"
+          mkdir Payload
+          cp -R "$APP" Payload/
+          zip -qry "$APP_NAME.ipa" Payload
+          ls -lh "$APP_NAME.ipa"
+
+      - name: Publish to Releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUILD_NUMBER: ${{ github.run_number }}
+          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+        run: |
+          TAG="build-$BUILD_NUMBER"
+          SHORT_SHA="${GITHUB_SHA::7}"
+          {
+            echo "Unsigned $APP_NAME build $BUILD_NUMBER from commit $SHORT_SHA."
+            echo
+            if [ -n "$COMMIT_MESSAGE" ]; then
+              echo "$COMMIT_MESSAGE"
+              echo
+            fi
+            echo "Install by opening $APP_NAME.ipa with TrollStore."
+          } > release-notes.md
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$APP_NAME.ipa" --clobber
+          else
+            gh release create "$TAG" "$APP_NAME.ipa" \
+              --title "$APP_NAME build $BUILD_NUMBER" \
+              --notes-file release-notes.md \
+              --target "$GITHUB_SHA" \
+              --latest
+          fi
+          {
+            echo "### $APP_NAME build $BUILD_NUMBER"
+            echo "https://github.com/$GITHUB_REPOSITORY/releases/tag/$TAG"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.APP_NAME }}-build-${{ github.run_number }}
+          path: ${{ env.APP_NAME }}.ipa
+          if-no-files-found: error
